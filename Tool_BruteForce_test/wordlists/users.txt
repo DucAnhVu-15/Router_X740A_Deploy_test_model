@@ -1,0 +1,10 @@
+admin
+root
+test
+user
+pi
+ubuntu
+guest
+operator
+support
+service
