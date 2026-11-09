@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <csignal>
@@ -74,13 +75,45 @@ uint32_t parse_ip(const std::string &text) {
     return a << 24 | b << 16 | c << 8 | d;
 }
 
+constexpr int kTimezoneOffset = 7 * 3600;  // giờ Việt Nam = UTC+7
+
 std::string iso_time(double seconds) {
-    std::time_t value = static_cast<std::time_t>(seconds);
+    std::time_t value = static_cast<std::time_t>(seconds) + kTimezoneOffset;
     std::tm parts{};
     gmtime_r(&value, &parts);
-    char text[32];
-    std::strftime(text, sizeof text, "%Y-%m-%dT%H:%M:%SZ", &parts);
+    char text[40];
+    std::strftime(text, sizeof text, "%Y-%m-%dT%H:%M:%S+07:00", &parts);
     return text;
+}
+
+// Chỉ HH:MM:SS theo giờ VN, cho dòng log gọn.
+std::string hms(double seconds) {
+    std::time_t value = static_cast<std::time_t>(seconds) + kTimezoneOffset;
+    std::tm parts{};
+    gmtime_r(&value, &parts);
+    char text[16];
+    std::strftime(text, sizeof text, "%H:%M:%S", &parts);
+    return text;
+}
+
+// Số nguyên có dấu phẩy ngăn nghìn, dễ đọc (vd 955814 -> 955,814).
+std::string commas(uint64_t value) {
+    std::string digits = std::to_string(value);
+    std::string out;
+    int count = 0;
+    for (auto it = digits.rbegin(); it != digits.rend(); ++it) {
+        if (count && count % 3 == 0) out.push_back(',');
+        out.push_back(*it);
+        ++count;
+    }
+    std::reverse(out.begin(), out.end());
+    return out;
+}
+
+std::string upper(const char *text) {
+    std::string out(text);
+    for (char &c : out) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return out;
 }
 
 struct Packet {
@@ -263,6 +296,14 @@ struct Host {
     Tracker dst, pair, port, syn_pair, arp, icmp;
     Episode episode;
 
+    // Thống kê bảng trạng thái theo CHU KỲ hiện tại (reset sau mỗi lần in), để phản ánh đúng thời điểm.
+    // cur_class: 0=benign,1=recon,2=bruteforce,3=dos — lớp tại cửa sổ có điểm cao nhất trong chu kỳ.
+    uint64_t windows_seen = 0;  // tổng từ đầu, cho stats chung
+    float cur_peak = 0;
+    uint8_t cur_class = 0;
+    uint32_t cur_windows = 0;
+    double last_seen = 0;
+
     Totals &tick(int64_t second) {
         if (bins.empty() || bins.back().second != second) bins.push_back({second, {}});
         return bins.back().totals;
@@ -359,7 +400,8 @@ struct Options {
     double threshold = kDefaultThreshold;
     uint32_t prefix = parse_ip("192.168.1.0") & 0xFFFFFF00;
     std::set<uint32_t> only, skip;
-    bool features = false, quiet = false;
+    bool features = false, quiet = false, status = false, live = false;
+    uint32_t interval = kStatsSeconds;  // giây giữa hai lần in stats/bảng
 };
 
 class Detector {
@@ -398,13 +440,41 @@ public:
         end_episodes(clock_, true);
     }
 
-    void stats() const {
+    void stats() {
         size_t active = 0;
         for (const auto &item : hosts_) active += item != nullptr;
-        double average = windows_done_ ? infer_total_ / static_cast<double>(windows_done_) : 0;
-        std::fprintf(stderr, "[stats] goi=%llu cua_so=%llu bao_dong=%llu dot=%llu host=%zu infer_tb=%.0fus infer_max=%.0fus\n",
-                     static_cast<unsigned long long>(packets_), static_cast<unsigned long long>(windows_done_),
-                     static_cast<unsigned long long>(alarms_), static_cast<unsigned long long>(episodes_), active, average, infer_max_);
+        const double average = windows_done_ ? infer_total_ / static_cast<double>(windows_done_) : 0;
+        std::fprintf(stderr, "   [%s] goi %s | cua so %s | bao dong %s | dot %s | host %zu | suy luan %.1fms (dinh %.0fms)\n",
+                     hms(clock_).c_str(), commas(packets_).c_str(), commas(windows_done_).c_str(),
+                     commas(alarms_).c_str(), commas(episodes_).c_str(), active, average / 1000.0, infer_max_ / 1000.0);
+        if (options_.status) status();
+    }
+
+    // Bảng trạng thái theo thời gian thực: chỉ host có hoạt động trong CHU KỲ vừa rồi, lớp + điểm đỉnh
+    // của chu kỳ đó. In xong thì reset, nên host ngừng tấn công sẽ về benign/biến mất ngay chu kỳ sau.
+    void status() {
+        static const char *const names[4] = {"benign", "recon", "bruteforce", "dos"};
+        std::vector<Host *> active;
+        for (auto &item : hosts_)
+            if (item && item->cur_windows) active.push_back(item.get());
+        std::sort(active.begin(), active.end(),
+                  [](const Host *a, const Host *b) { return a->cur_peak > b->cur_peak; });
+        std::fprintf(stderr, "   %-15s  %-10s  %6s  %s\n", "host", "lop", "diem", "cua so");
+        if (active.empty()) std::fprintf(stderr, "   (khong co host nao hoat dong)\n");
+        size_t shown = 0;
+        for (Host *h : active) {
+            if (shown < 20)
+                std::fprintf(stderr, "   %-15s  %-10s  %5.0f%%  %u\n", ip_text(h->ip).c_str(), names[h->cur_class],
+                             h->cur_peak * 100.0, h->cur_windows);
+            ++shown;
+        }
+        if (shown > 20) std::fprintf(stderr, "   ... va %zu host khac\n", shown - 20);
+        for (auto &item : hosts_)  // reset cho chu kỳ sau
+            if (item) {
+                item->cur_windows = 0;
+                item->cur_peak = 0;
+                item->cur_class = 0;
+            }
     }
 
 private:
@@ -582,6 +652,14 @@ private:
         const double score = 1.0 - static_cast<double>(proba[0]);
         const bool alarm = score >= options_.threshold;
         const size_t attack = static_cast<size_t>(std::max_element(proba.begin() + 1, proba.end()) - proba.begin() - 1);
+        // Lớp dự đoán cho bảng trạng thái: benign nếu chưa vượt ngưỡng, ngược lại là lớp tấn công.
+        ++item.windows_seen;
+        ++item.cur_windows;
+        item.last_seen = t_end;
+        if (static_cast<float>(score) >= item.cur_peak) {
+            item.cur_peak = static_cast<float>(score);
+            item.cur_class = static_cast<uint8_t>(alarm ? attack + 1 : 0);
+        }
         if (alarm) raise(item, t_end, attack, static_cast<float>(score));
         if (windows_.is_open()) log_window(item, t_first, t_end, score, alarm, attack, proba, micros, f);
     }
@@ -636,11 +714,14 @@ private:
             episode.active = true;
             episode.start = t_end;
             ++episodes_;
-            char line[200];
-            std::snprintf(line, sizeof line,
+            const std::string ip = ip_text(item.ip);
+            char json[200], pretty[160];
+            std::snprintf(json, sizeof json,
                           "{\"event\":\"attack_start\",\"time\":\"%s\",\"ts\":%.3f,\"host\":\"%s\",\"class\":\"%s\",\"score\":%.4f}\n",
-                          iso_time(t_end).c_str(), t_end, ip_text(item.ip).c_str(), kClassNames[attack], score);
-            emit(line);
+                          iso_time(t_end).c_str(), t_end, ip.c_str(), kClassNames[attack], score);
+            std::snprintf(pretty, sizeof pretty, ">> [%s] BAO DONG  %-15s  %-10s  diem %.2f",
+                          hms(t_end).c_str(), ip.c_str(), upper(kClassNames[attack]).c_str(), score);
+            emit(json, pretty);
         }
         episode.last = t_end;
         episode.top = std::max(episode.top, score);
@@ -651,13 +732,17 @@ private:
     void end_episode(Host &item) {
         Episode &episode = item.episode;
         const size_t best = static_cast<size_t>(std::max_element(episode.classes.begin(), episode.classes.end()) - episode.classes.begin());
-        char line[320];
-        std::snprintf(line, sizeof line,
+        const std::string ip = ip_text(item.ip);
+        char json[320], pretty[200];
+        std::snprintf(json, sizeof json,
                       "{\"event\":\"attack_end\",\"time\":\"%s\",\"host\":\"%s\",\"class\":\"%s\",\"start\":\"%s\",\"duration_s\":%.1f,"
                       "\"windows\":%u,\"recon\":%u,\"bruteforce\":%u,\"dos\":%u,\"max_score\":%.4f}\n",
-                      iso_time(episode.last).c_str(), ip_text(item.ip).c_str(), kClassNames[best], iso_time(episode.start).c_str(),
+                      iso_time(episode.last).c_str(), ip.c_str(), kClassNames[best], iso_time(episode.start).c_str(),
                       episode.last - episode.start, episode.windows, episode.classes[0], episode.classes[1], episode.classes[2], episode.top);
-        emit(line);
+        std::snprintf(pretty, sizeof pretty, "<< [%s] ket thuc  %-15s  %-10s  %.0fs, %u cua so, diem cao nhat %.2f",
+                      hms(episode.last).c_str(), ip.c_str(), upper(kClassNames[best]).c_str(),
+                      episode.last - episode.start, episode.windows, episode.top);
+        emit(json, pretty);
         episode.active = false;
     }
 
@@ -666,9 +751,11 @@ private:
             if (item && item->episode.active && (all || now - item->episode.last > kEpisodeGap)) end_episode(*item);
     }
 
-    void emit(const char *line) {
-        if (!options_.quiet) std::cout << line << std::flush;
-        if (alerts_) alerts_ << line << std::flush;
+    // Console nhận dòng gọn cho người đọc; file --output giữ JSON cho máy phân tích.
+    // Ở chế độ --live (vẽ lại bảng), bỏ dòng cuộn ra console để không bị xoá; cảnh báo vẫn vào file.
+    void emit(const char *json, const char *pretty) {
+        if (!options_.quiet && !options_.live) std::cout << pretty << "\n" << std::flush;
+        if (alerts_) alerts_ << json << std::flush;
     }
 
     static constexpr double kNever = 1e300;
@@ -740,7 +827,8 @@ int run(const Options &options) {
     std::time_t last_wall = 0, last_stats = std::time(nullptr);
     auto report = [&] {
         const std::time_t now = std::time(nullptr);
-        if (now - last_stats >= kStatsSeconds) {
+        if (now - last_stats >= static_cast<std::time_t>(options.interval)) {
+            if (options.live) std::cerr << "\033[2J\033[H";  // xoá màn hình, vẽ lại như top
             detector.stats();
             last_stats = now;
         }
@@ -775,7 +863,8 @@ int run(const Options &options) {
 
 const char kUsage[] =
     "usage: ids_agent <ids_model.ort> [--threshold x] [--lan-prefix 192.168.1.] [--output alerts.jsonl]\n"
-    "                 [--windows windows.csv] [--features] [--host ip] [--exclude ip] [--quiet]\n"
+    "                 [--windows windows.csv] [--features] [--status] [--live] [--interval giay]\n"
+    "                 [--host ip] [--exclude ip] [--quiet]\n"
     "       ids_agent --print-features\n";
 
 }  // namespace
@@ -805,6 +894,9 @@ int main(int argc, char **argv) {
             else if (key == "--output") options.output = next();
             else if (key == "--windows") options.windows = next();
             else if (key == "--features") options.features = true;
+            else if (key == "--status") options.status = true;
+            else if (key == "--live") { options.live = true; options.status = true; }
+            else if (key == "--interval") options.interval = std::max(1u, static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10)));
             else if (key == "--host") options.only.insert(parse_ip(next()));
             else if (key == "--exclude") options.skip.insert(parse_ip(next()));
             else if (key == "--quiet") options.quiet = true;

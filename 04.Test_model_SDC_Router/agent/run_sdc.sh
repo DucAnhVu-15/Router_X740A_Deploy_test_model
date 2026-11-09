@@ -1,9 +1,9 @@
 #!/bin/sh
 # Bắt gói trên router rồi chạy model. Nhấn Ctrl+C để dừng.
 # Thiết bị join qua DHCP mở một phiên; model chạy khi đủ DHCP + DNS + mDNS + TLS hoặc hết timeout.
-# Cách dùng: sh run_sdc.sh [timeout giây] [thư mục model]
+# Cách dùng: sh run_sdc.sh [timeout giây] [thư mục model, mặc định là thư mục chứa script]
 TIMEOUT="${1:-300}"
-DIR="${2:-/tmp}"
+DIR="${2:-$(cd "$(dirname "$0")" && pwd)}"
 IFACE="br-lan"
 OUTPUT="/tmp/sdc_results.jsonl"
 TCPDUMP_LOG="/tmp/sdc_tcpdump.log"

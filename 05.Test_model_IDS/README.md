@@ -5,17 +5,33 @@ File cần chép đã nằm sẵn ở `build/router/` (6,7 MB).
 
 ## 1. Chép lên router
 
-Chạy trên PC (PowerShell), tại thư mục này. `/tmp` nằm trên RAM nên khởi động lại router là mất.
+`/tmp` của router nằm trên RAM: khởi động lại router là mất, phải chép lại từ đầu.
+Nếu `ls /tmp/ids` vẫn còn file thì bỏ qua bước này.
 
-```powershell
-scp -O -r build/router admin@192.168.1.1:/tmp/ids
-```
-
-Trên router:
+Trên router, dừng model đang chạy (nếu có) và tạo thư mục:
 
 ```sh
-cd /tmp/ids && md5sum -c checksums.md5 && chmod +x ids_agent
+killall tcpdump
+mkdir -p /tmp/ids
 ```
+
+Trên PC (cmd), **đứng trong `build\router`** rồi chép:
+
+```bat
+cd /d D:\01.AI_Security\Router_X740_A\05.Test_model_IDS\build\router
+scp -O ids_agent ids_model.ort run_ids.sh capture_ids.sh check_router.sh ids_monitor.sh selftest.pcap selftest.expected checksums.md5 admin@192.168.1.1:/tmp/ids/
+```
+
+`-O` dùng giao thức scp cũ vì router không có SFTP. Không dùng `scp -r build/router .../tmp/ids` khi `/tmp/ids`
+đã tồn tại, vì khi đó file sẽ vào `/tmp/ids/router`.
+
+Trên router. File chép từ Windows bị mất quyền chạy, nên **bắt buộc phải `chmod +x`**:
+
+```sh
+cd /tmp/ids && chmod +x ids_agent && md5sum -c checksums.md5
+```
+
+`md5sum -c` phải báo `OK` cho tất cả file.
 
 ## 2. Kiểm tra router
 
@@ -41,6 +57,18 @@ sh ids_monitor.sh running 60 2     # tuỳ chọn: RAM, CPU
 ```
 
 Dừng sớm bằng `killall tcpdump`. Mỗi lần chạy ghi đè `ids_windows.csv`, nên chép về trước khi chạy lần sau.
+
+Tham số của `run_ids.sh`:
+
+| Cách gọi | Ý nghĩa |
+|---|---|
+| `sh run_ids.sh 600` | Chạy 600 s rồi tự dừng. `0` hoặc bỏ trống: chạy đến khi `Ctrl+C` |
+| `INTERVAL=3 sh run_ids.sh 600` | In log mỗi 3 s (mặc định 5) |
+| `LIVE=1 sh run_ids.sh 600` | Hiện bảng cập nhật tại chỗ, giống `top` |
+| `EXCLUDE=192.168.1.1 sh run_ids.sh 600` | Bỏ qua một địa chỉ IP |
+
+Xem RAM liên tục: mở SSH thứ hai, chạy vòng lặp ở mục 5 trong `04.Test_model_SDC_Router/README.md`
+(tự nhận `ids_agent`), hoặc dùng `top`.
 
 ## 4. Chạy tấn công thử
 
@@ -85,6 +113,28 @@ sh capture_ids.sh 300        # trên router: bắt 300 s, tối đa 300.000 gói
 scp -O admin@192.168.1.1:/tmp/ids_capture.pcap build/
 python tools/pkt_features_ref.py build/ids_capture.pcap --out build/windows.csv
 ```
+
+## Đổi qua lại với SDC
+
+IDS nằm ở `/tmp/ids`, SDC nằm ở `/tmp/sdc` (xem `04.Test_model_SDC_Router/README.md`).
+
+```sh
+sh /tmp/ids/run_ids.sh 600     # chạy IDS
+sh /tmp/sdc/run_sdc.sh 300     # chạy SDC
+killall tcpdump                # dừng model đang chạy
+```
+
+File kết quả không đè nhau (`/tmp/ids_*` và `/tmp/sdc_*`). Mỗi lần chỉ nên chạy một model, vì `killall tcpdump`,
+kể cả lệnh hẹn giờ trong `run_ids.sh`, dừng tcpdump của cả hai.
+
+## Lỗi thường gặp
+
+| Lỗi | Nguyên nhân, cách sửa |
+|---|---|
+| `scp: stat local "ids_agent": No such file or directory` | Đang đứng sai thư mục trên PC. Phải `cd` vào `build\router` |
+| `build/router: No such file or directory` | Chạy `scp -r build/router` từ trong `build\router`. Dùng lệnh chép từng file ở mục 1 |
+| `nice: can't execute '/tmp/ids/ids_agent': Permission denied` | Chưa `chmod +x ids_agent` |
+| `md5sum` báo `FAILED` | File chép lỗi hoặc là bản cũ. Chép lại file đó |
 
 ## Thư mục
 
