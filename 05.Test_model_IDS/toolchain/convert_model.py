@@ -15,7 +15,7 @@ import onnx
 import onnxruntime as ort
 
 PROJECT = Path(__file__).resolve().parent.parent
-RUN_DIR = Path(sys.argv[1]) if len(sys.argv) > 1 else PROJECT / "model" / "20261105_1550"
+RUN_DIR = Path(sys.argv[1]) if len(sys.argv) > 1 else PROJECT / "model" / "20261111_1058"
 OUT = PROJECT / "build" / "ort"
 SAMPLES = 200000
 

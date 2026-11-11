@@ -38,7 +38,11 @@ constexpr double kMaxSeconds = 10.0;     // T_MAX
 constexpr double kNewGap = 300.0;        // NEW_GAP
 constexpr double kShort = 60.0, kLong = 300.0;
 constexpr double kEpisodeGap = 60.0;
-constexpr double kDefaultThreshold = 0.8821289696466122;  // run 20261105_1550
+// build_ids.sh <run_id> truyền ngưỡng từ deploy_config.json qua -DIDS_THRESHOLD; giá trị dưới chỉ dùng khi build tay.
+#ifndef IDS_THRESHOLD
+#define IDS_THRESHOLD 0.9928104801023478  // run 20261111_1058
+#endif
+constexpr double kDefaultThreshold = IDS_THRESHOLD;
 constexpr size_t kFeatures = 97, kClasses = 4, kKinds = 12;
 constexpr size_t kMaxFrame = 262144;
 constexpr size_t kMaxItems = 70000;      // hơn 65.536 port và mọi ngưỡng đếm của model (cao nhất 17.284)
@@ -401,6 +405,7 @@ struct Options {
     uint32_t prefix = parse_ip("192.168.1.0") & 0xFFFFFF00;
     std::set<uint32_t> only, skip;
     bool features = false, quiet = false, status = false, live = false;
+    bool labels = false;  // in nhãn của mọi cửa sổ ngay khi chấm, không in dòng báo động theo đợt
     uint32_t interval = kStatsSeconds;  // giây giữa hai lần in stats/bảng
 };
 
@@ -661,7 +666,17 @@ private:
             item.cur_class = static_cast<uint8_t>(alarm ? attack + 1 : 0);
         }
         if (alarm) raise(item, t_end, attack, static_cast<float>(score));
+        if (options_.labels) print_label(item, t_end, alarm ? attack + 1 : 0, score, count);
         if (windows_.is_open()) log_window(item, t_first, t_end, score, alarm, attack, proba, micros, f);
+    }
+
+    // Một dòng cho mỗi cửa sổ: nhãn là lớp tấn công nếu điểm vượt ngưỡng, ngược lại là BENIGN.
+    void print_label(const Host &item, double t_end, size_t label, double score, size_t count) {
+        static const char *const names[4] = {"BENIGN", "RECON", "BRUTEFORCE", "DOS"};
+        char line[128];
+        std::snprintf(line, sizeof line, "[%s] %-15s  %-10s  diem %.2f  %zu goi", hms(t_end).c_str(),
+                      ip_text(item.ip).c_str(), names[label], score, count);
+        std::cout << line << "\n" << std::flush;
     }
 
     template <typename Push>
@@ -754,7 +769,7 @@ private:
     // Console nhận dòng gọn cho người đọc; file --output giữ JSON cho máy phân tích.
     // Ở chế độ --live (vẽ lại bảng), bỏ dòng cuộn ra console để không bị xoá; cảnh báo vẫn vào file.
     void emit(const char *json, const char *pretty) {
-        if (!options_.quiet && !options_.live) std::cout << pretty << "\n" << std::flush;
+        if (!options_.quiet && !options_.live && !options_.labels) std::cout << pretty << "\n" << std::flush;
         if (alerts_) alerts_ << json << std::flush;
     }
 
@@ -864,7 +879,7 @@ int run(const Options &options) {
 const char kUsage[] =
     "usage: ids_agent <ids_model.ort> [--threshold x] [--lan-prefix 192.168.1.] [--output alerts.jsonl]\n"
     "                 [--windows windows.csv] [--features] [--status] [--live] [--interval giay]\n"
-    "                 [--host ip] [--exclude ip] [--quiet]\n"
+    "                 [--host ip] [--exclude ip] [--quiet] [--labels]\n"
     "       ids_agent --print-features\n";
 
 }  // namespace
@@ -900,6 +915,7 @@ int main(int argc, char **argv) {
             else if (key == "--host") options.only.insert(parse_ip(next()));
             else if (key == "--exclude") options.skip.insert(parse_ip(next()));
             else if (key == "--quiet") options.quiet = true;
+            else if (key == "--labels") options.labels = true;
             else throw std::runtime_error("tham so la: " + key);
         }
         return run(options);

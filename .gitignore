@@ -14,6 +14,7 @@ __pycache__/
 05.Test_model_IDS/BAO_CAO_TEST.md
 05.Test_model_IDS/TONG_HOP_CAI_TIEN_DOS_VA_DANH_GIA_TEST.md
 
-# Trong thư mục model chỉ đẩy model.onnx, bỏ csv/png/json/joblib...
-05.Test_model_IDS/model/20261105_1550/*
-!05.Test_model_IDS/model/20261105_1550/model.onnx
+# Trong thư mục model chỉ đẩy model.onnx và deploy_config.json (build cần), bỏ csv/png/joblib...
+05.Test_model_IDS/model/*/*
+!05.Test_model_IDS/model/*/model.onnx
+!05.Test_model_IDS/model/*/deploy_config.json
