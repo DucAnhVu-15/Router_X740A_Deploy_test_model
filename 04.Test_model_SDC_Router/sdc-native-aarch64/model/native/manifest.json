@@ -1,0 +1,10 @@
+{
+  "source_sha256": "a8949d2ba764ed28a245aef552cda9f81a1064961e278021d8fbee8482a2c7c5",
+  "preparation_sha256": "4aa727296cf0ca509ddba70ed3a967f84ea2903a2cc901800ad4771a74406ec5",
+  "producer_runtime": "1.31.1",
+  "files": {
+    "sdc_packet.ort": "cf9143c4da216cf5efa1c6fac39aa29342f1ca2b38ad410ab7a66c14da96ba3d",
+    "sdc_tail.ort": "ee02076b2756427cbed415ce68deb37056a5998537f3a533c7db51965c925b76",
+    "sdc_hn.bin": "ea1a4f9e7f6cce80f5d63218d4a97c3a0df7da062962d225d1962521a35eefd9"
+  }
+}
