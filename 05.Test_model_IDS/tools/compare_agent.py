@@ -17,7 +17,7 @@ from validate_lab import ZIP, pcap_name
 
 PROJECT = Path(__file__).resolve().parent.parent
 TEST = PROJECT / "build" / "test"
-SCRIPT = "/mnt/d/01.AI_Security/Router_X740_A/05.Test_model_IDS/toolchain/test_agent.sh"
+SCRIPT = PROJECT / "toolchain" / "test_agent.sh"
 
 
 def to_wsl(path):
@@ -50,7 +50,7 @@ def lab_pcaps(per_scenario, max_mb=8):
 
 def compare(path, model):
     output = TEST / f"{Path(path).stem}.agent.csv"
-    done = subprocess.run(["wsl.exe", "-d", "Ubuntu", "--exec", "bash", SCRIPT, to_wsl(path), to_wsl(output)],
+    done = subprocess.run(["wsl.exe", "-d", "Ubuntu", "--exec", "bash", to_wsl(SCRIPT), to_wsl(path), to_wsl(output)],
                           capture_output=True, text=True)
     if "agent_exit=0" not in done.stdout:
         raise RuntimeError(f"{path}: {done.stdout[-300:]} {done.stderr[-300:]}")

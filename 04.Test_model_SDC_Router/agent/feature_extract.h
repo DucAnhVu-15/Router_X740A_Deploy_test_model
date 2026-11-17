@@ -18,6 +18,9 @@ using Mac = std::array<uint8_t, 6>;
 std::string mac_text(const Mac &mac);
 std::string normalize_hostname(const std::string &value);
 std::string sanitize_utf8(const std::string &value);
+std::string json_escape(const std::string &text);
+// 2026-11-11T01:28:57Z, hoặc 2026-11-11T01:28:57.373Z khi có millis.
+std::string iso_time(uint32_t seconds, int millis = -1);
 
 // Đếm giá trị trong cửa sổ, hoà thì lấy giá trị nhỏ nhất theo thứ tự chuỗi.
 class ModeCounter {
@@ -40,12 +43,19 @@ private:
     std::vector<std::string> tokens_;
 };
 
+// Bản ghi thô theo định dạng observation của bộ thu thập (device_observations.jsonl).
+// Mỗi phần tử là một object JSON hoàn chỉnh. Chỉ có dữ liệu khi bật enable_observations().
+struct RawRecords {
+    std::vector<std::string> dhcp, dns, mdns, tls;
+};
+
 struct DeviceWindow {
     ModeCounter prl, vci, hostname, fingerprint, version, alpn, ciphers;
     TokenSet dns, mdns, sni;
     std::string model, cast_model, mi_model;
     uint32_t packets = 0, dhcp = 0, dns_queries = 0, mdns_packets = 0, tls = 0;
     uint32_t start = 0;  // thời điểm gói DHCP mở phiên
+    RawRecords raw;
 
     bool all_sources() const { return dhcp && dns_queries && mdns_packets && tls; }
 };
@@ -66,8 +76,12 @@ public:
     // Bật chế độ phiên: chỉ thiết bị vừa join qua DHCP mới được gom dữ liệu.
     void enable_trigger(uint32_t timeout, uint32_t cooldown);
 
-    // data là khung Ethernet đã bắt; length là số byte có trong data.
-    void add_frame(const uint8_t *data, size_t length, uint32_t seconds);
+    // Giữ bản ghi thô của từng gói (tối đa 64 bản ghi mỗi nguồn, như bộ thu thập) để in observation.
+    // Không ảnh hưởng 12 cột đưa vào model.
+    void enable_observations() { observations_ = true; }
+
+    // data là khung Ethernet đã bắt; length là số byte có trong data; millis là phần lẻ của giây.
+    void add_frame(const uint8_t *data, size_t length, uint32_t seconds, uint32_t millis = 0);
 
     // Lấy và xoá dữ liệu cửa sổ hiện tại.
     std::map<Mac, DeviceWindow> take_window();
@@ -86,6 +100,7 @@ private:
     };
 
     void on_dhcp(const uint8_t *data, size_t length);
+    void on_dhcp_reply(const uint8_t *data, size_t length);
     void on_dns(const Mac &src, const uint8_t *data, size_t length);
     void on_mdns(const Mac &src, const uint8_t *data, size_t length);
     void on_tcp(const Mac &src, const std::string &flow, const uint8_t *tcp, size_t length, uint32_t seconds);
@@ -93,13 +108,15 @@ private:
     void mdns_entry(DeviceWindow &device, int section, const std::string &name, const std::string &value);
     void prune(uint32_t seconds);
     DeviceWindow *session(const Mac &mac);
+    bool keep(const std::vector<std::string> &records) const;
+    std::string stamp() const { return iso_time(now_, static_cast<int>(millis_)); }
 
     std::map<Mac, DeviceWindow> devices_;
     std::map<Mac, uint32_t> finished_at_;
     std::unordered_map<std::string, PendingHello> pending_;
     Mac router_mac_{};
-    bool trigger_ = false;
-    uint32_t timeout_ = 300, cooldown_ = 0, now_ = 0;
+    bool trigger_ = false, observations_ = false;
+    uint32_t timeout_ = 300, cooldown_ = 0, now_ = 0, millis_ = 0;
     re2::RE2 model_re_, cast_re_, mi_re_;
     size_t frames_ = 0;
 };

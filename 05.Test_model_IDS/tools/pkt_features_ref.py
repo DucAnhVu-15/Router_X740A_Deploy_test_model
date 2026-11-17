@@ -22,7 +22,7 @@ import onnxruntime as ort
 import pandas as pd
 
 HERE = Path(__file__).resolve().parent
-RUN_DIR = HERE.parent / "model" / "20261105_1550"
+RUN_DIR = HERE.parent / "model" / "20261111_1058"
 TSHARK_WINDOWS = r"C:\Program Files\Wireshark\tshark.exe"
 
 FIELDS = [

@@ -2,16 +2,25 @@
 # Bắt gói trên router rồi chạy model. Nhấn Ctrl+C để dừng.
 # Thiết bị join qua DHCP mở một phiên; model chạy khi đủ DHCP + DNS + mDNS + TLS hoặc hết timeout.
 # Cách dùng: sh run_sdc.sh [timeout giây] [thư mục model, mặc định là thư mục chứa script]
+# Mỗi lần suy luận ghi thêm một dòng observation (dhcp/dns/mdns/tls thô + kết quả) vào $OBS_OUTPUT.
+# Đổi chỗ ghi: SDC_OBS=/duong/dan sh run_sdc.sh; tắt hẳn: SDC_OBS= sh run_sdc.sh
 TIMEOUT="${1:-300}"
 DIR="${2:-$(cd "$(dirname "$0")" && pwd)}"
 IFACE="br-lan"
 OUTPUT="/tmp/sdc_results.jsonl"
+OBS_OUTPUT="${SDC_OBS-/tmp/sdc_observations.jsonl}"
 TCPDUMP_LOG="/tmp/sdc_tcpdump.log"
 MEMORY_LIMIT_KB=180000
 ROUTER_MAC="$(cat /sys/class/net/$IFACE/address)"
 
 NICE=""
 command -v nice >/dev/null 2>&1 && NICE="nice -n 10"
+
+OBS_ARGS=""
+if [ -n "$OBS_OUTPUT" ]; then
+    OBS_ARGS="--obs-output $OBS_OUTPUT"
+    echo "observation: $OBS_OUTPUT" >&2
+fi
 
 # DHCP, DNS, mDNS, và TLS đi ra cổng 443.
 # ClientHello có thể chia nhiều đoạn: lấy gói mở đầu handshake và gói có cờ PSH,
@@ -22,6 +31,6 @@ FILTER="$FILTER or (ip6 and tcp dst port 443 and (ip6[53] & 8 != 0 or ip6[40 + (
 
 tcpdump -i "$IFACE" -n -U -s 4096 -w - "$FILTER" 2>"$TCPDUMP_LOG" | (
     ulimit -v "$MEMORY_LIMIT_KB"
-    exec $NICE "$DIR/sdc_agent" "$DIR" --trigger-dhcp --timeout "$TIMEOUT" --output "$OUTPUT" --router-mac "$ROUTER_MAC"
+    exec $NICE "$DIR/sdc_agent" "$DIR" --trigger-dhcp --timeout "$TIMEOUT" --output "$OUTPUT" --router-mac "$ROUTER_MAC" $OBS_ARGS
 )
 tail -3 "$TCPDUMP_LOG"

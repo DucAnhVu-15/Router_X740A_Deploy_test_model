@@ -10,9 +10,10 @@ An toàn:
 - Dừng ngay khi đăng nhập đúng (nếu lỡ trúng mật khẩu thật thì thoát, không làm gì thêm).
 
 Cách dùng:
-  python ssh_bruteforce.py 192.168.1.182
-  python ssh_bruteforce.py 192.168.1.182 --intensity aggressive --max 2000
-  python ssh_bruteforce.py 192.168.1.182 -U wordlists/users.txt -P wordlists/passwords.txt
+#   python ssh_bruteforce.py 192.168.1.182
+#   python ssh_bruteforce.py 192.168.1.182 --intensity aggressive --max 2000
+#   python ssh_bruteforce.py 192.168.1.182 -U wordlists/users.txt -P wordlists/passwords.txt
+  python ssh_bruteforce.py 192.168.1.78 -U wordlists/users.txt -P wordlists/passwords.txt
 """
 import argparse
 import ipaddress

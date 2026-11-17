@@ -17,3 +17,8 @@ __pycache__/
 # Trong thư mục model chỉ đẩy model.onnx, bỏ csv/png/json/joblib...
 05.Test_model_IDS/model/20261105_1550/*
 !05.Test_model_IDS/model/20261105_1550/model.onnx
+
+# X740-C: chỉ đẩy code, không đẩy model gốc, gói binary và kết quả train
+04.Test_model_SDC_Router/model_origin/
+04.Test_model_SDC_Router/sdc-native-aarch64/
+05.Test_model_IDS/model/20261111_1058/

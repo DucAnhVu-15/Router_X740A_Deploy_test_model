@@ -4,6 +4,8 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
+#include <iterator>
 
 namespace sdc {
 namespace {
@@ -12,12 +14,17 @@ const char *const kMissing = "<missing>";
 constexpr size_t kMaxTokens = 40;
 constexpr size_t kMaxHello = 16384;
 constexpr size_t kMaxPending = 256;
+constexpr size_t kMaxFinished = 256;  // danh sách MAC vừa xong phiên lớn tới đây thì dọn mục đã hết cooldown
+constexpr size_t kMaxRecords = 64;  // bộ thu thập cũng giữ tối đa 64 bản ghi mỗi nguồn
 constexpr uint32_t kHelloTimeout = 5;
 constexpr uint16_t kEtherIpv4 = 0x0800, kEtherIpv6 = 0x86DD, kEtherVlan = 0x8100, kEtherQinq = 0x88A8;
 constexpr uint8_t kTcp = 6, kUdp = 17;
-constexpr uint16_t kTypeTxt = 16;
+constexpr uint16_t kTypeA = 1, kTypeNs = 2, kTypeCname = 5, kTypePtr = 12, kTypeTxt = 16;
 constexpr int kQuestion = 0;
+constexpr uint8_t kBootRequest = 1, kBootReply = 2;
 constexpr uint8_t kDhcpDiscover = 1, kDhcpRequest = 3;
+constexpr size_t kDhcpOptions = 240;
+constexpr uint32_t kDhcpCookie = 0x63825363;
 
 uint16_t be16(const uint8_t *p) { return static_cast<uint16_t>(p[0] << 8 | p[1]); }
 uint32_t be32(const uint8_t *p) {
@@ -89,7 +96,185 @@ std::string txt_value(const uint8_t *data, size_t length) {
     return value;
 }
 
+// ---- Bản ghi observation (chỉ dùng khi bật enable_observations) ----
+
+std::string hex(const uint8_t *data, size_t length) {
+    static const char digits[] = "0123456789abcdef";
+    std::string out(length * 2, '0');
+    for (size_t i = 0; i < length; ++i) {
+        out[2 * i] = digits[data[i] >> 4];
+        out[2 * i + 1] = digits[data[i] & 0x0F];
+    }
+    return out;
+}
+
+std::string quoted(const std::string &text) { return "\"" + json_escape(sanitize_utf8(text)) + "\""; }
+
+std::string json_strings(const std::vector<std::string> &items) {
+    std::string out = "[";
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (i) out += ',';
+        out += quoted(items[i]);
+    }
+    return out + "]";
+}
+
+bool is_bootp(const uint8_t *data, size_t length, uint8_t op) {
+    return length >= kDhcpOptions && data[0] == op && data[2] == 6 && be32(data + 236) == kDhcpCookie;
+}
+
+struct DhcpMessage {
+    uint8_t type = 0;  // option 53
+    std::string prl, vci, hostname;
+};
+
+// options khác nullptr thì nhận thêm toàn bộ option dạng {"code":..,"value_hex":".."}, đúng thứ tự trên dây.
+DhcpMessage parse_dhcp(const uint8_t *data, size_t length, std::string *options) {
+    DhcpMessage out;
+    size_t at = kDhcpOptions;
+    while (at < length) {
+        uint8_t code = data[at];
+        if (code == 255) break;
+        if (code == 0) {
+            ++at;
+            continue;
+        }
+        if (at + 2 > length || at + 2 + data[at + 1] > length) break;
+        uint8_t size = data[at + 1];
+        const uint8_t *value = data + at + 2;
+        if (code == 53 && size == 1) {
+            out.type = value[0];
+        } else if (code == 55) {
+            out.prl = join_numbers(std::vector<uint32_t>(value, value + size));
+        } else if (code == 60) {
+            out.vci.assign(reinterpret_cast<const char *>(value), size);
+        } else if (code == 12) {
+            out.hostname.assign(reinterpret_cast<const char *>(value), size);
+        }
+        if (options != nullptr) {
+            if (!options->empty()) *options += ',';
+            *options += "{\"code\":" + std::to_string(code) + ",\"value_hex\":\"" + hex(value, size) + "\"}";
+        }
+        at += 2 + size;
+    }
+    return out;
+}
+
+const char *dhcp_name(uint8_t type) {
+    static const char *const names[] = {"UNKNOWN", "DISCOVER", "OFFER", "REQUEST", "DECLINE",
+                                        "ACK",     "NAK",      "RELEASE", "INFORM"};
+    return type < sizeof names / sizeof names[0] ? names[type] : names[0];
+}
+
+std::string dhcp_json(const uint8_t *data, const DhcpMessage &message, const std::string &options,
+                      const std::string &stamp) {
+    return "{\"timestamp\":\"" + stamp + "\",\"transaction_id\":" + std::to_string(be32(data + 4)) +
+           ",\"message_type\":" + std::to_string(message.type) + ",\"message_name\":\"" +
+           dhcp_name(message.type) + "\",\"hostname\":" + quoted(message.hostname) +
+           ",\"vendor_class_id\":" + quoted(message.vci) + ",\"parameter_request_list\":[" + message.prl +
+           "],\"options\":[" + options + "]}";
+}
+
+// value giống bộ thu thập: A ra địa chỉ IPv4, PTR/CNAME/NS ra tên miền, TXT nối các chuỗi bằng `;`
+// (ký tự điều khiển thành `?`). Loại khác để trống, xem rdata_hex.
+std::string record_value(const uint8_t *data, size_t length, size_t at, uint16_t type, size_t size) {
+    if (type == kTypeA && size == 4) {
+        char text[16];
+        std::snprintf(text, sizeof text, "%u.%u.%u.%u", data[at], data[at + 1], data[at + 2], data[at + 3]);
+        return text;
+    }
+    if (type == kTypePtr || type == kTypeCname || type == kTypeNs) {
+        std::string name;
+        return read_name(data, length, at, name) ? name : std::string();
+    }
+    if (type == kTypeTxt) {
+        std::string value = txt_value(data + at, size);
+        for (char &c : value)
+            if (static_cast<uint8_t>(c) < 0x20 || c == 0x7F) c = '?';
+        return value;
+    }
+    return "";
+}
+
+// Một gói DNS/mDNS (length >= 12). Gói hỏng thì giữ các bản ghi đọc được trước chỗ hỏng.
+std::string dns_json(const uint8_t *data, size_t length, const std::string &stamp) {
+    static const char *const sections[] = {"questions", "answers", "authorities", "additionals"};
+    const uint16_t flags = be16(data + 2);
+    std::string out = "{\"timestamp\":\"" + stamp + "\",\"response\":" + ((flags & 0x8000) ? "true" : "false") +
+                      ",\"response_code\":" + std::to_string(flags & 0x0F);
+    size_t at = 12;
+    bool ok = true;
+    std::string name;
+    for (int section = 0; section < 4; ++section) {
+        out += ",\"" + std::string(sections[section]) + "\":[";
+        const uint16_t count = ok ? be16(data + 4 + 2 * section) : 0;
+        for (uint16_t i = 0; i < count; ++i) {
+            size_t size = 0;
+            ok = read_name(data, length, at, name) && at + (section == kQuestion ? 4 : 10) <= length;
+            if (ok && section != kQuestion) {
+                size = be16(data + at + 8);
+                ok = at + 10 + size <= length;
+            }
+            if (!ok) break;
+            const uint16_t type = be16(data + at);
+            if (i) out += ',';
+            out += "{\"name\":" + quoted(name) + ",\"type\":" + std::to_string(type);
+            if (section == kQuestion) {
+                at += 4;
+            } else {
+                // Bỏ bit cache-flush của mDNS khỏi class, như bộ thu thập.
+                out += ",\"class\":" + std::to_string(be16(data + at + 2) & 0x7FFF) +
+                       ",\"ttl\":" + std::to_string(be32(data + at + 4)) + ",\"value\":" +
+                       quoted(record_value(data, length, at + 10, type, size)) + ",\"rdata_hex\":\"" +
+                       hex(data + at + 10, size) + "\"";
+                at += 10 + size;
+            }
+            out += '}';
+        }
+        out += ']';
+    }
+    return out + "}";
+}
+
+std::string tls_json(const std::string &stamp, const char *version, const std::vector<std::string> &names,
+                     const std::vector<std::string> &protocols, const std::vector<uint32_t> &ciphers) {
+    return "{\"timestamp\":\"" + stamp + "\",\"legacy_version\":\"" + version + "\",\"server_names\":" +
+           json_strings(names) + ",\"alpn\":" + json_strings(protocols) + ",\"cipher_suites\":[" +
+           join_numbers(ciphers) + "]}";
+}
+
 }  // namespace
+
+std::string json_escape(const std::string &text) {
+    std::string out;
+    out.reserve(text.size() + 8);
+    for (char c : text) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += c;
+        } else if (static_cast<unsigned char>(c) < 0x20) {
+            char code[7];
+            std::snprintf(code, sizeof code, "\\u%04x", c);
+            out += code;
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+std::string iso_time(uint32_t seconds, int millis) {
+    std::time_t value = seconds;
+    std::tm parts{};
+    gmtime_r(&value, &parts);
+    char text[40];
+    size_t used = std::strftime(text, sizeof text, "%Y-%m-%dT%H:%M:%S", &parts);
+    if (millis >= 0)
+        std::snprintf(text + used, sizeof text - used, ".%03dZ", millis % 1000);
+    else
+        std::snprintf(text + used, sizeof text - used, "Z");
+    return text;
+}
 
 std::string mac_text(const Mac &mac) {
     char text[18];
@@ -221,6 +406,11 @@ std::vector<FinishedSession> FeatureExtractor::take_finished(uint32_t now, bool 
             ++it;
             continue;
         }
+        // MAC ngẫu nhiên làm danh sách này lớn dần; mục đã qua cooldown không còn tác dụng.
+        if (finished_at_.size() >= kMaxFinished) {
+            for (auto old = finished_at_.begin(); old != finished_at_.end();)
+                old = now - old->second >= cooldown_ ? finished_at_.erase(old) : std::next(old);
+        }
         finished_at_[it->first] = now;
         done.push_back({it->first, std::move(it->second), reason, now});
         it = devices_.erase(it);
@@ -228,9 +418,14 @@ std::vector<FinishedSession> FeatureExtractor::take_finished(uint32_t now, bool 
     return done;
 }
 
-void FeatureExtractor::add_frame(const uint8_t *data, size_t length, uint32_t seconds) {
+bool FeatureExtractor::keep(const std::vector<std::string> &records) const {
+    return observations_ && records.size() < kMaxRecords;
+}
+
+void FeatureExtractor::add_frame(const uint8_t *data, size_t length, uint32_t seconds, uint32_t millis) {
     ++frames_;
     now_ = seconds;
+    millis_ = millis;
     if (length < 14) return;
     Mac src;
     std::memcpy(src.data(), data + 6, 6);
@@ -271,6 +466,10 @@ void FeatureExtractor::add_frame(const uint8_t *data, size_t length, uint32_t se
             on_dhcp(payload, size);
             return;
         }
+        if (dport == 68 && observations_) {
+            on_dhcp_reply(payload, size);
+            return;
+        }
         if ((src[0] & 1) != 0 || src == router_mac_) return;
         if (dport == 53) {
             on_dns(src, payload, size);
@@ -285,41 +484,18 @@ void FeatureExtractor::add_frame(const uint8_t *data, size_t length, uint32_t se
 }
 
 void FeatureExtractor::on_dhcp(const uint8_t *data, size_t length) {
-    constexpr size_t kOptions = 240;
-    if (length < kOptions || data[0] != 1 || data[2] != 6 || be32(data + 236) != 0x63825363) return;
+    if (!is_bootp(data, length, kBootRequest)) return;
     Mac client;
     std::memcpy(client.data(), data + 28, 6);
     if ((client[0] & 1) != 0 || client == router_mac_) return;
 
-    std::string prl, vci, hostname;
-    uint8_t message = 0;
-    size_t at = kOptions;
-    while (at < length) {
-        uint8_t code = data[at];
-        if (code == 255) break;
-        if (code == 0) {
-            ++at;
-            continue;
-        }
-        if (at + 2 > length || at + 2 + data[at + 1] > length) break;
-        uint8_t size = data[at + 1];
-        const uint8_t *value = data + at + 2;
-        if (code == 53 && size == 1) {
-            message = value[0];
-        } else if (code == 55) {
-            std::vector<uint32_t> items(value, value + size);
-            prl = join_numbers(items);
-        } else if (code == 60) {
-            vci.assign(reinterpret_cast<const char *>(value), size);
-        } else if (code == 12) {
-            hostname.assign(reinterpret_cast<const char *>(value), size);
-        }
-        at += 2 + size;
-    }
+    std::string options;
+    const DhcpMessage message = parse_dhcp(data, length, observations_ ? &options : nullptr);
 
     if (trigger_ && devices_.find(client) == devices_.end()) {
         // Gia hạn lease có ciaddr khác 0: thiết bị đã kết nối từ trước, không phải join.
-        const bool join = message == kDhcpDiscover || (message == kDhcpRequest && be32(data + 12) == 0);
+        const bool join =
+            message.type == kDhcpDiscover || (message.type == kDhcpRequest && be32(data + 12) == 0);
         auto finished = finished_at_.find(client);
         const bool cooling = finished != finished_at_.end() && now_ - finished->second < cooldown_;
         if (!join || cooling) return;
@@ -329,9 +505,22 @@ void FeatureExtractor::on_dhcp(const uint8_t *data, size_t length) {
     DeviceWindow &device = devices_[client];
     ++device.packets;
     ++device.dhcp;
-    if (!prl.empty()) device.prl.add(prl);
-    device.vci.add(sanitize_utf8(vci));
-    device.hostname.add(sanitize_utf8(hostname));
+    if (!message.prl.empty()) device.prl.add(message.prl);
+    device.vci.add(sanitize_utf8(message.vci));
+    device.hostname.add(sanitize_utf8(message.hostname));
+    if (keep(device.raw.dhcp)) device.raw.dhcp.push_back(dhcp_json(data, message, options, stamp()));
+}
+
+// OFFER/ACK/NAK từ router: chỉ ghi vào observation của thiết bị đang được gom, không tính vào feature.
+void FeatureExtractor::on_dhcp_reply(const uint8_t *data, size_t length) {
+    if (!is_bootp(data, length, kBootReply)) return;
+    Mac client;
+    std::memcpy(client.data(), data + 28, 6);
+    auto found = devices_.find(client);
+    if (found == devices_.end() || !keep(found->second.raw.dhcp)) return;
+    std::string options;
+    const DhcpMessage message = parse_dhcp(data, length, &options);
+    found->second.raw.dhcp.push_back(dhcp_json(data, message, options, stamp()));
 }
 
 void FeatureExtractor::on_dns(const Mac &src, const uint8_t *data, size_t length) {
@@ -343,6 +532,7 @@ void FeatureExtractor::on_dns(const Mac &src, const uint8_t *data, size_t length
     DeviceWindow &device = *found;
     ++device.packets;
     ++device.dns_queries;
+    if (keep(device.raw.dns)) device.raw.dns.push_back(dns_json(data, length, stamp()));
     std::string name;
     for (uint16_t i = 0; i < questions; ++i) {
         if (!read_name(data, length, at, name) || at + 4 > length) return;
@@ -382,6 +572,7 @@ void FeatureExtractor::on_mdns(const Mac &src, const uint8_t *data, size_t lengt
     DeviceWindow &device = *found;
     ++device.packets;
     ++device.mdns_packets;
+    if (keep(device.raw.mdns)) device.raw.mdns.push_back(dns_json(data, length, stamp()));
     std::string name;
     for (uint16_t i = 0; i < counts[0]; ++i) {
         if (!read_name(data, length, at, name) || at + 4 > length) return;
@@ -528,6 +719,7 @@ void FeatureExtractor::on_client_hello(const Mac &src, const uint8_t *data, size
     device.alpn.add(lower_ascii(alpn));
     if (!cipher_text.empty()) device.fingerprint.add(std::string(version) + "|" + cipher_text + "|" + alpn);
     for (const auto &name : names) device.sni.add_name(sanitize_utf8(name));
+    if (keep(device.raw.tls)) device.raw.tls.push_back(tls_json(stamp(), version, names, protocols, ciphers));
 }
 
 std::vector<std::string> feature_row(const Mac &mac, const DeviceWindow &device,

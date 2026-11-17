@@ -3,6 +3,10 @@
 // khi đủ DHCP + DNS + mDNS + TLS hoặc hết --timeout giây kể từ gói DHCP.
 // Cách dùng: tcpdump ... -w - | sdc_agent <thư mục model> [--window 300] [--trigger-dhcp] [--timeout 300]
 //                               [--output file] [--leases /tmp/dhcp.leases] [--router-mac aa:bb:..] [--columns]
+//                               [--obs-output file]
+// --obs-output: mỗi lần suy luận ghi thêm một dòng observation (mac, hostname, dhcp, dns, mdns, tls như
+// device_observations.jsonl của bộ thu thập, tối đa 64 bản ghi mỗi nguồn) kèm khoá "inference" chứa
+// kết quả và 12 cột đã đưa vào model.
 #include <poll.h>
 #include <unistd.h>
 
@@ -38,6 +42,7 @@ uint32_t swap32(uint32_t v) {
 struct Options {
     std::string model_dir;
     std::string output;
+    std::string observations;
     std::string leases = "/tmp/dhcp.leases";
     std::string router_mac;
     uint32_t window = 300;
@@ -80,23 +85,8 @@ private:
     size_t begin_ = 0, end_ = 0;
 };
 
-std::string json_escape(const std::string &text) {
-    std::string out;
-    out.reserve(text.size() + 8);
-    for (char c : text) {
-        if (c == '"' || c == '\\') {
-            out += '\\';
-            out += c;
-        } else if (static_cast<unsigned char>(c) < 0x20) {
-            char code[7];
-            std::snprintf(code, sizeof code, "\\u%04x", c);
-            out += code;
-        } else {
-            out += c;
-        }
-    }
-    return out;
-}
+using sdc::iso_time;
+using sdc::json_escape;
 
 bool parse_mac(const std::string &text, sdc::Mac &mac) {
     unsigned v[6];
@@ -118,15 +108,6 @@ std::map<std::string, std::string> read_leases(const std::string &path) {
     return names;
 }
 
-std::string iso_time(uint32_t seconds) {
-    std::time_t value = seconds;
-    std::tm parts{};
-    gmtime_r(&value, &parts);
-    char text[32];
-    std::strftime(text, sizeof text, "%Y-%m-%dT%H:%M:%SZ", &parts);
-    return text;
-}
-
 std::string sources(const sdc::DeviceWindow &device) {
     std::string out;
     auto add = [&out](const char *name, uint32_t count) {
@@ -145,10 +126,30 @@ const char *const kColumnNames[sdc::kColumns] = {
     "dhcp_prl", "tls_fp", "tls_version", "tls_alpn", "tls_ciphers", "dhcp_vci",
     "dns_tokens", "mdns_tokens", "tls_sni_tokens", "mac_oui", "dhcp_hostname", "mdns_model"};
 
+std::string columns_json(const std::vector<std::string> &row) {
+    std::string out = "{";
+    for (size_t i = 0; i < sdc::kColumns; ++i)
+        out += std::string(i ? "," : "") + "\"" + kColumnNames[i] + "\":\"" + json_escape(row[i]) + "\"";
+    return out + "}";
+}
+
+std::string records_json(const std::vector<std::string> &records) {
+    std::string out = "[";
+    for (size_t i = 0; i < records.size(); ++i) {
+        if (i) out += ',';
+        out += records[i];
+    }
+    return out + "]";
+}
+
 class Reporter {
 public:
     Reporter(sdc::Pipeline &pipeline, const Options &options) : pipeline_(pipeline), options_(options) {
         if (!options.output.empty()) file_.open(options.output, std::ios::app);
+        if (!options.observations.empty()) {
+            observations_.open(options.observations, std::ios::app);
+            if (!observations_) std::cerr << "khong mo duoc " << options.observations << "\n";
+        }
     }
 
     void flush(std::map<sdc::Mac, sdc::DeviceWindow> window, uint32_t start) {
@@ -169,16 +170,37 @@ private:
                 uint32_t elapsed) {
         const std::string text = sdc::mac_text(mac);
         auto lease = leases.find(text);
-        auto row = sdc::feature_row(mac, device, lease == leases.end() ? "" : lease->second);
+        const std::string lease_name = lease == leases.end() ? "" : lease->second;
+        auto row = sdc::feature_row(mac, device, lease_name);
         try {
             auto start_time = std::chrono::steady_clock::now();
             sdc::Labels labels = pipeline_.predict(row);
             double ms = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - start_time).count();
             write(text, device, row, labels, start, reason, elapsed, ms);
+            if (observations_.is_open()) write_observation(text, device, lease_name, row, labels, start, reason, elapsed, ms);
         } catch (const std::exception &error) {
             std::cerr << "LOI suy luan " << text << ": " << error.what() << "\n";
         }
+    }
+
+    // Một dòng giống device_observations.jsonl, cộng khoá "inference" ở cuối.
+    void write_observation(const std::string &mac, const sdc::DeviceWindow &device, const std::string &lease_name,
+                           const std::vector<std::string> &row, const sdc::Labels &labels, uint32_t start,
+                           const char *reason, uint32_t elapsed, double ms) {
+        std::string host = device.hostname.best();  // hostname thô, chưa chuẩn hoá
+        if (host == "<missing>") host = lease_name;
+        std::ostringstream out;
+        out << "{\"mac\":\"" << mac << "\",\"hostname\":\"" << json_escape(sdc::sanitize_utf8(host))
+            << "\",\"dhcp\":" << records_json(device.raw.dhcp) << ",\"dns\":" << records_json(device.raw.dns)
+            << ",\"mdns\":" << records_json(device.raw.mdns) << ",\"tls\":" << records_json(device.raw.tls)
+            << ",\"inference\":{\"window_start\":\"" << iso_time(start) << "\",\"reason\":\"" << reason
+            << "\",\"elapsed_s\":" << elapsed << ",\"make\":\"" << json_escape(labels[0]) << "\",\"type\":\""
+            << json_escape(labels[1]) << "\",\"model\":\"" << json_escape(labels[2]) << "\",\"infer_ms\":" << ms
+            << ",\"packets\":{\"dhcp\":" << device.dhcp << ",\"dns\":" << device.dns_queries
+            << ",\"mdns\":" << device.mdns_packets << ",\"tls\":" << device.tls
+            << "},\"columns\":" << columns_json(row) << "}}\n";
+        observations_ << out.str() << std::flush;
     }
 
     void write(const std::string &mac, const sdc::DeviceWindow &device, const std::vector<std::string> &row,
@@ -189,12 +211,7 @@ private:
             << json_escape(labels[2]) << "\",\"hostname\":\"" << json_escape(row[sdc::kHostname])
             << "\",\"reason\":\"" << reason << "\",\"elapsed_s\":" << elapsed << ",\"sources\":\"" << sources(device)
             << "\",\"packets\":" << device.packets << ",\"infer_ms\":" << ms;
-        if (options_.columns) {
-            out << ",\"columns\":{";
-            for (size_t i = 0; i < sdc::kColumns; ++i)
-                out << (i ? "," : "") << "\"" << kColumnNames[i] << "\":\"" << json_escape(row[i]) << "\"";
-            out << "}";
-        }
+        if (options_.columns) out << ",\"columns\":" << columns_json(row);
         out << "}\n";
         std::cout << out.str() << std::flush;
         if (file_) file_ << out.str() << std::flush;
@@ -202,7 +219,7 @@ private:
 
     sdc::Pipeline &pipeline_;
     const Options &options_;
-    std::ofstream file_;
+    std::ofstream file_, observations_;
 };
 
 int run(const Options &options) {
@@ -215,6 +232,7 @@ int run(const Options &options) {
     }
     bool swapped = header[0] == swap32(kMagicMicro) || header[0] == swap32(kMagicNano);
     uint32_t magic = swapped ? swap32(header[0]) : header[0];
+    const uint32_t per_milli = magic == kMagicNano ? 1000000 : 1000;  // phần lẻ giây là ns hoặc µs
     uint32_t link = swapped ? swap32(header[5]) : header[5];
     if ((magic != kMagicMicro && magic != kMagicNano) || (link & 0xFFFF) != kLinkEthernet) {
         std::cerr << "chi ho tro pcap Ethernet, link=" << link << "\n";
@@ -231,6 +249,7 @@ int run(const Options &options) {
     sdc::Mac router{};
     if (!options.router_mac.empty() && parse_mac(options.router_mac, router)) extractor.set_router_mac(router);
     if (options.trigger) extractor.enable_trigger(options.timeout, kCooldownSeconds);
+    if (!options.observations.empty()) extractor.enable_observations();
 
     Reporter reporter(pipeline, options);
     std::vector<uint8_t> frame(kMaxFrame);
@@ -247,6 +266,7 @@ int run(const Options &options) {
     uint32_t record[4];
     while (input.read(record, sizeof record, on_idle)) {
         uint32_t seconds = swapped ? swap32(record[0]) : record[0];
+        uint32_t millis = std::min<uint32_t>((swapped ? swap32(record[1]) : record[1]) / per_milli, 999);
         uint32_t captured = swapped ? swap32(record[2]) : record[2];
         if (captured > kMaxFrame) {
             std::cerr << "pcap hong: captured=" << captured << "\n";
@@ -258,7 +278,7 @@ int run(const Options &options) {
 
         if (options.trigger) {
             reporter.flush(extractor.take_finished(seconds));  // phiên hết giờ không nhận gói đến muộn
-            extractor.add_frame(frame.data(), captured, seconds);
+            extractor.add_frame(frame.data(), captured, seconds, millis);
             reporter.flush(extractor.take_finished(seconds));
             continue;
         }
@@ -267,7 +287,7 @@ int run(const Options &options) {
             reporter.flush(extractor.take_window(), window_start);
             window_start = seconds;
         }
-        extractor.add_frame(frame.data(), captured, seconds);
+        extractor.add_frame(frame.data(), captured, seconds, millis);
     }
     if (options.trigger)
         reporter.flush(extractor.take_finished(last_seconds, true));
@@ -282,7 +302,7 @@ int run(const Options &options) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         std::cerr << "usage: sdc_agent <model_dir> [--window 300] [--trigger-dhcp] [--timeout 300] "
-                     "[--output file] [--leases path] [--router-mac mac] [--columns]\n";
+                     "[--output file] [--leases path] [--router-mac mac] [--columns] [--obs-output file]\n";
         return 2;
     }
     Options options;
@@ -308,6 +328,8 @@ int main(int argc, char **argv) {
                 options.router_mac = next();
             } else if (key == "--columns") {
                 options.columns = true;
+            } else if (key == "--obs-output") {
+                options.observations = next();
             } else {
                 std::cerr << "tham so la: " << key << "\n";
                 return 2;

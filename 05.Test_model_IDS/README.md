@@ -1,4 +1,7 @@
-# Test model IDS trên router X740-A
+# Test model IDS trên router X740-C
+
+Router: OpenWrt SNAPSHOT, aarch64, RAM 858 MB, LAN `br-lan` 192.168.1.1/24. Dùng chung bản build aarch64 musl
+với X740-A (`BAO_CAO_TEST.md` là kết quả test trên X740-A).
 
 Chạy riêng model IDS, không liên quan SDC: `tcpdump | ids_agent` trên router, xuất cảnh báo JSON.
 File cần chép đã nằm sẵn ở `build/router/` (6,7 MB).
@@ -8,30 +11,14 @@ File cần chép đã nằm sẵn ở `build/router/` (6,7 MB).
 `/tmp` của router nằm trên RAM: khởi động lại router là mất, phải chép lại từ đầu.
 Nếu `ls /tmp/ids` vẫn còn file thì bỏ qua bước này.
 
-Trên router, dừng model đang chạy (nếu có) và tạo thư mục:
-
-```sh
-killall tcpdump
-mkdir -p /tmp/ids
-```
-
-Trên PC (cmd), **đứng trong `build\router`** rồi chép:
+**Chạy trên PC (cmd), không chạy trong cửa sổ SSH của router.** Chỉ một lệnh, hỏi mật khẩu một lần:
 
 ```bat
-cd /d D:\01.AI_Security\Router_X740_A\05.Test_model_IDS\build\router
-scp -O ids_agent ids_model.ort run_ids.sh capture_ids.sh check_router.sh ids_monitor.sh selftest.pcap selftest.expected checksums.md5 admin@192.168.1.1:/tmp/ids/
+D:\01.AI_Security\Router_X740_C\05.Test_model_IDS\toolchain\deploy_router.bat
 ```
 
-`-O` dùng giao thức scp cũ vì router không có SFTP. Không dùng `scp -r build/router .../tmp/ids` khi `/tmp/ids`
-đã tồn tại, vì khi đó file sẽ vào `/tmp/ids/router`.
-
-Trên router. File chép từ Windows bị mất quyền chạy, nên **bắt buộc phải `chmod +x`**:
-
-```sh
-cd /tmp/ids && chmod +x ids_agent && md5sum -c checksums.md5
-```
-
-`md5sum -c` phải báo `OK` cho tất cả file.
+Script dừng IDS đang chạy, tạo `/tmp/ids`, chép file, `chmod +x ids_agent` và chạy `md5sum -c`. Thành công thì in
+`: OK` cho tất cả file và dòng `XONG: da chep vao /tmp/ids`. Sau đó vào cửa sổ router, gõ `cd /tmp/ids`.
 
 ## 2. Kiểm tra router
 
@@ -58,14 +45,33 @@ sh ids_monitor.sh running 60 2     # tuỳ chọn: RAM, CPU
 
 Dừng sớm bằng `killall tcpdump`. Mỗi lần chạy ghi đè `ids_windows.csv`, nên chép về trước khi chạy lần sau.
 
+Mặc định, mỗi khi model chấm xong một cửa sổ, agent in ngay một dòng nhãn:
+
+```
+[03:13:00] 192.168.1.236    RECON       diem 1.00  34 goi
+[03:13:00] 192.168.1.182    BENIGN      diem 0.70  50 goi
+```
+
+- Mỗi cửa sổ là các gói một IP gửi đi, chốt khi đủ 50 gói hoặc sau 10 s. Host đang hoạt động có ít nhất một
+  dòng mỗi 10 s.
+- Nhãn là `RECON`, `BRUTEFORCE` hoặc `DOS` nếu `diem` (1 − xác suất lành tính) vượt ngưỡng 0,9928 (run `20261111_1058`), ngược lại là
+  `BENIGN`. Vì vậy một dòng `BENIGN` vẫn có thể có `diem` khá cao, ví dụ 0,70.
+- Không in dòng `BAO DONG`/`ket thuc` theo đợt, nhưng các đợt vẫn được ghi vào `/tmp/ids_alerts.jsonl`. Mọi cửa
+  sổ kèm xác suất từng lớp nằm trong `/tmp/ids_windows.csv`.
+- Mỗi 30 s có một dòng thống kê tổng (số gói, số cửa sổ, thời gian suy luận).
+
 Tham số của `run_ids.sh`:
 
 | Cách gọi | Ý nghĩa |
 |---|---|
 | `sh run_ids.sh 600` | Chạy 600 s rồi tự dừng. `0` hoặc bỏ trống: chạy đến khi `Ctrl+C` |
-| `INTERVAL=3 sh run_ids.sh 600` | In log mỗi 3 s (mặc định 5) |
-| `LIVE=1 sh run_ids.sh 600` | Hiện bảng cập nhật tại chỗ, giống `top` |
 | `EXCLUDE=192.168.1.1 sh run_ids.sh 600` | Bỏ qua một địa chỉ IP |
+| `THRESHOLD=0.9 sh run_ids.sh 600` | Đổi ngưỡng báo động (mặc định 0,9928 theo run `20261111_1058`) |
+| `LABELS=0 sh run_ids.sh 600` | Kiểu cũ: dòng `BAO DONG` đầu mỗi đợt, `ket thuc` khi hết 60 s không báo động, kèm bảng trạng thái |
+| `LABELS=0 INTERVAL=3 sh run_ids.sh 600` | Kiểu cũ, in bảng mỗi 3 s (mặc định 5) |
+| `LIVE=1 sh run_ids.sh 600` | Kiểu cũ, bảng cập nhật tại chỗ giống `top` |
+
+Lọc chỉ xem dòng tấn công: `sh run_ids.sh 600 | grep -v BENIGN`.
 
 Xem RAM liên tục: mở SSH thứ hai, chạy vòng lặp ở mục 5 trong `04.Test_model_SDC_Router/README.md`
 (tự nhận `ids_agent`), hoặc dùng `top`.
