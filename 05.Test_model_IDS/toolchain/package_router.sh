@@ -9,11 +9,11 @@ ROOT="$PROJECT/build"
 OUT="$ROOT/router"
 QEMU="$HOME/sdc-router/qemu/qemu-aarch64"
 SELFTEST="$ROOT/test/lab/tcp_syn_scan_0004.pcap"
-FILES="ids_agent ids_model.ort run_ids.sh capture_ids.sh check_router.sh ids_monitor.sh selftest.pcap selftest.expected"
+FILES="ids_agent ids_model.ort run_ids.sh capture_ids.sh check_router.sh ids_monitor.sh diag_lan.sh selftest.pcap selftest.expected"
 
 mkdir -p "$OUT"
 cp "$ROOT/ids_agent" "$ROOT/ort/ids_model.ort" "$OUT/"
-cp "$PROJECT/agent/run_ids.sh" "$PROJECT/agent/capture_ids.sh" "$PROJECT/agent/check_router.sh" "$PROJECT/agent/ids_monitor.sh" "$OUT/"
+cp "$PROJECT/agent/run_ids.sh" "$PROJECT/agent/capture_ids.sh" "$PROJECT/agent/check_router.sh" "$PROJECT/agent/ids_monitor.sh" "$PROJECT/agent/diag_lan.sh" "$OUT/"
 cp "$SELFTEST" "$OUT/selftest.pcap"
 
 "$QEMU" "$OUT/ids_agent" "$OUT/ids_model.ort" --quiet --windows /tmp/ids_expected.csv < "$OUT/selftest.pcap" 2>/tmp/ids_expected.err
